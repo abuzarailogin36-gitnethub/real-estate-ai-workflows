@@ -43,6 +43,7 @@ from inbound.booking_client import (
     get_free_slots, send_slot_offer, confirm_booking,
     send_confirmation_sms, handle_opt_out, get_pending_slots, clear_pending,
 )
+from inbound.referral import record_lead, record_booking, register_partner, list_partners, get_partner
 from inbound.config import WEBHOOK_SECRET
 
 logging.basicConfig(
@@ -113,7 +114,11 @@ async def quiz_webhook(request: Request):
 
     # ── 4. GHL upsert contact + fields + tags ─────────────────────────────
     field_ids = _load_field_ids()
-    contact_id = upsert_contact(submission, result, field_ids)
+    try:
+        contact_id = upsert_contact(submission, result, field_ids)
+    except Exception as exc:
+        logger.error('GHL upsert error: %s', exc)
+        raise HTTPException(status_code=502, detail='GHL API unavailable — try again')
     if not contact_id:
         raise HTTPException(status_code=502, detail='Failed to upsert GHL contact')
 
@@ -126,7 +131,12 @@ async def quiz_webhook(request: Request):
     # ── 7. Slack alert (hot leads only) ──────────────────────────────────
     post_hot_lead_alert(submission, result, contact_id, opp_id)
 
-    # ── 8. Offer 2 booking slots via SMS (hot + SMS opt-in only) ─────────
+    # ── 8. Referral attribution ───────────────────────────────────────────
+    ref = submission.get('referral_partner', '')
+    if ref:
+        record_lead(ref)
+
+    # ── 9. Offer 2 booking slots via SMS (hot + SMS opt-in only) ─────────
     offered_slots = []
     if result.band == 'hot' and submission.get('sms_optin'):
         slots = get_free_slots(count=2)
@@ -187,6 +197,10 @@ async def reply_webhook(request: Request):
                 _put(f'/opportunities/{opp_id}', {
                     'pipelineStageId': PIPELINE_STAGES['appointment_set'],
                 })
+            # Referral attribution — increment booking count
+            ref_code = payload.get('referral_partner', '')
+            if ref_code:
+                record_booking(ref_code)
             logger.info('Booked: contact %s → appointment %s at %s', contact_id, appt_id, chosen)
             return JSONResponse({'action': 'booked', 'appointment_id': appt_id, 'slot': chosen})
         else:
@@ -195,6 +209,37 @@ async def reply_webhook(request: Request):
     # Unrecognised reply — log and ignore (conversation engine handles it)
     logger.info('Unrecognised reply from %s — passing to conversation engine', contact_id)
     return JSONResponse({'action': 'unrecognised'})
+
+
+@app.get('/referrals/partners')
+def get_partners():
+    """List all referral partners and their ledger totals."""
+    return JSONResponse({'partners': list_partners()})
+
+
+@app.post('/referrals/partners')
+async def add_partner(request: Request):
+    """
+    Register a new referral partner.
+    Body: { "code": "BROKER01", "name": "Bob Smith", "type": "broker", "fee_percent": 1.0 }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail='Invalid JSON')
+
+    code = body.get('code', '').strip().upper()
+    name = body.get('name', '').strip()
+    if not code or not name:
+        raise HTTPException(status_code=422, detail='code and name required')
+
+    partner = register_partner(
+        code=code,
+        name=name,
+        partner_type=body.get('type', 'other'),
+        fee_percent=float(body.get('fee_percent', 1.0)),
+    )
+    return JSONResponse({'partner': partner})
 
 
 def _normalise_phone(raw: str) -> str:
