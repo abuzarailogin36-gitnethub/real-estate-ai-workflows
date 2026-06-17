@@ -1,0 +1,17 @@
+[Unit]
+Description=New Door Inbound Webhook Engine
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/newdoor/scripts
+Environment=PYTHONPATH=/opt/newdoor/scripts:/opt/newdoor/scripts/inbound
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/uvicorn inbound.webhook_server:app --host 0.0.0.0 --port 8080 --log-level info
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/newdoor/logs/inbound_webhook.log
+StandardError=append:/opt/newdoor/logs/inbound_webhook.log
+
+[Install]
+WantedBy=multi-user.target
