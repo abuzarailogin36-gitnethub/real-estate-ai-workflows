@@ -39,6 +39,10 @@ from inbound.regrid_client import lookup_parcel
 from inbound.ghl_client import upsert_contact, upsert_opportunity, _load_field_ids
 from inbound.router import route, BAND_STAGE
 from inbound.slack_client import post_hot_lead_alert
+from inbound.booking_client import (
+    get_free_slots, send_slot_offer, confirm_booking,
+    send_confirmation_sms, handle_opt_out, get_pending_slots, clear_pending,
+)
 from inbound.config import WEBHOOK_SECRET
 
 logging.basicConfig(
@@ -122,6 +126,14 @@ async def quiz_webhook(request: Request):
     # ── 7. Slack alert (hot leads only) ──────────────────────────────────
     post_hot_lead_alert(submission, result, contact_id, opp_id)
 
+    # ── 8. Offer 2 booking slots via SMS (hot + SMS opt-in only) ─────────
+    offered_slots = []
+    if result.band == 'hot' and submission.get('sms_optin'):
+        slots = get_free_slots(count=2)
+        if slots:
+            send_slot_offer(contact_id, submission['name'], submission.get('parcel_address', ''), slots)
+            offered_slots = slots
+
     return JSONResponse({
         'contact_id':  contact_id,
         'opportunity_id': opp_id,
@@ -132,6 +144,57 @@ async def quiz_webhook(request: Request):
             'band': result.band,
         },
     })
+
+
+@app.post('/webhooks/reply')
+async def reply_webhook(request: Request):
+    """
+    Receives inbound SMS replies from GHL (configured in a GHL workflow).
+    Payload: { "contactId": "...", "message": "...", "contactName": "..." }
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail='Invalid JSON')
+
+    contact_id = payload.get('contactId') or payload.get('contact_id', '')
+    raw_msg    = (payload.get('message') or payload.get('body') or '').strip()
+    name       = payload.get('contactName') or payload.get('name', 'Lead')
+
+    if not contact_id or not raw_msg:
+        raise HTTPException(status_code=422, detail='contactId and message required')
+
+    logger.info('Inbound reply from %s (%s): %s', contact_id, name, raw_msg[:100])
+
+    # Opt-out — honour immediately, no further processing
+    if raw_msg.upper() in ('STOP', 'UNSUBSCRIBE', 'CANCEL', 'QUIT', 'END'):
+        handle_opt_out(contact_id)
+        return JSONResponse({'action': 'opted_out', 'contact_id': contact_id})
+
+    # Booking choice — "1" or "2"
+    slots = get_pending_slots(contact_id)
+    if slots and raw_msg in ('1', '2'):
+        chosen = slots[int(raw_msg) - 1]
+        appt_id = confirm_booking(contact_id, name, chosen)
+        if appt_id:
+            send_confirmation_sms(contact_id, name, chosen)
+            clear_pending(contact_id)
+            # Move opportunity to Appointment Set
+            from inbound.ghl_client import find_opportunity, _put
+            from config import PIPELINE_STAGES
+            opp_id = find_opportunity(contact_id)
+            if opp_id:
+                _put(f'/opportunities/{opp_id}', {
+                    'pipelineStageId': PIPELINE_STAGES['appointment_set'],
+                })
+            logger.info('Booked: contact %s → appointment %s at %s', contact_id, appt_id, chosen)
+            return JSONResponse({'action': 'booked', 'appointment_id': appt_id, 'slot': chosen})
+        else:
+            return JSONResponse({'action': 'booking_failed'}, status_code=502)
+
+    # Unrecognised reply — log and ignore (conversation engine handles it)
+    logger.info('Unrecognised reply from %s — passing to conversation engine', contact_id)
+    return JSONResponse({'action': 'unrecognised'})
 
 
 def _normalise_phone(raw: str) -> str:
