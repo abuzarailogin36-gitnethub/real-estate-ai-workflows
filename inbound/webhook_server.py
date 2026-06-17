@@ -38,6 +38,7 @@ from inbound.scoring import score
 from inbound.regrid_client import lookup_parcel
 from inbound.ghl_client import upsert_contact, upsert_opportunity, _load_field_ids
 from inbound.router import route, BAND_STAGE
+from inbound.slack_client import post_hot_lead_alert
 from inbound.config import WEBHOOK_SECRET
 
 logging.basicConfig(
@@ -117,6 +118,9 @@ async def quiz_webhook(request: Request):
 
     # ── 6. Create/update opportunity ─────────────────────────────────────
     opp_id = upsert_opportunity(contact_id, submission, stage_id)
+
+    # ── 7. Slack alert (hot leads only) ──────────────────────────────────
+    post_hot_lead_alert(submission, result, contact_id, opp_id)
 
     return JSONResponse({
         'contact_id':  contact_id,
