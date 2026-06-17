@@ -7,6 +7,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/newdoor/scripts
 Environment=PYTHONPATH=/opt/newdoor/scripts:/opt/newdoor/scripts/inbound
+EnvironmentFile=/root/.hermes/.env
 ExecStart=/usr/local/lib/hermes-agent/venv/bin/uvicorn inbound.webhook_server:app --host 0.0.0.0 --port 8080 --log-level info
 Restart=always
 RestartSec=5
